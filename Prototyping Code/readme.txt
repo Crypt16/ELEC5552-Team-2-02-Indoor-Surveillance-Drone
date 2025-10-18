@@ -1,0 +1,1 @@
+This folder contains all the prototyping code use for testing and creation including Navigation, Obstacle Avoidance, Web Server, Hovering etc. Note these bits of code only test for certain aspects of the drone and are not part of the final product. In the absence of the final product, this code can be tested using an ESP32 MCU connected to Arduino IDE.
