@@ -139,3 +139,5 @@ If any sensor fails to init, you’ll see which step failed (e.g., not found at
 
 - **Wrong pins on TTGO S3**
   - Double‑check the board pinout; avoid strapping pins / USB/JTAG pins.
+
+- DP
