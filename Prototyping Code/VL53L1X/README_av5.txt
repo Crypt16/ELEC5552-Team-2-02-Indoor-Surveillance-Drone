@@ -119,3 +119,4 @@ Driver status codes (if any) are printed on OOR/failed reads to help debug.
   - Increase `TIMING_BUDGET_MS` for better measurement stability.
   - Confirm the sensor’s field‑of‑view is unobstructed.
   - Highly shiny/absorbing targets may reduce reliability.
+- DP
