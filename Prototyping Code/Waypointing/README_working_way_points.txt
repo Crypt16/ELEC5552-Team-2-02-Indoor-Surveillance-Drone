@@ -136,3 +136,5 @@ Troubleshooting
   Ensure `last_height_mm` is valid (60–4000 mm). Verify `K_pix_to_rad_*` scales.
 - **Queue appears stuck**  
   Use `status` to confirm an active move; adjust tolerance with `t N` or `reset` odom.
+
+- DP
