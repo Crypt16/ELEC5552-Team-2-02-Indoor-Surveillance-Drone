@@ -1,0 +1,721 @@
+// main.cpp — ESP32 WROOM-32 Flight Controller for Takeoff/Hover
+// Adapted for ESP32 WROOM-32 dev board from LilyGO T-Display S3 version
+#include <Arduino.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <Wire.h>
+#include <stdarg.h>
+#include <math.h>
+#include <Preferences.h>
+#include "web_ui.h"
+
+/* ================= DEBUG OPTIONS ================= */
+// Uncomment to enable single motor debug mode (only Motor 1 will run)
+// #define DEBUG_MOTOR_SINGLE
+// Uncomment to enable verbose serial debugging
+#define DEBUG_SERIAL
+#ifdef DEBUG_SERIAL
+  #define DEBUG_PRINT(x) Serial.print(x)
+  #define DEBUG_PRINTLN(x) Serial.println(x)
+  #define DEBUG_PRINTF(fmt, ...) Serial.printf(fmt, ##__VA_ARGS__)
+#else
+  #define DEBUG_PRINT(x)
+  #define DEBUG_PRINTLN(x)
+  #define DEBUG_PRINTF(fmt, ...)
+#endif
+/* ================= CONFIG ================= */
+#ifndef WIFI_STA_SSID
+  #define WIFI_STA_SSID ""
+#endif
+#ifndef WIFI_STA_PASS
+  #define WIFI_STA_PASS ""
+#endif
+static const char* AP_SSID = "ProtoDrone";
+static const char* AP_PASS = "12345678";
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+/* ================= PINS FOR ESP32 WROOM-32 ================= */
+// Updated for ESP32 WROOM-32 dev board
+#define VBAT_ADC_PIN 34      // ADC1_CH6 - standard analog input pin
+#define I2C_SDA 21           // Standard I2C SDA
+#define I2C_SCL 22           // Standard I2C SCL
+#define MOTOR1_PIN 32        // Motor 1 (FR)
+#define MOTOR2_PIN 26        // Motor 2 (BR)
+#define MOTOR3_PIN 25        // Motor 3 (BL)
+#define MOTOR4_PIN 33        // Motor 4 (FL)
+/* ================= CONSTANTS ================= */
+static const uint32_t PWM_FREQ_HZ = 18000;
+static const uint8_t PWM_RES_BITS = 8;
+static const float SLEW_PCT_PER_SEC = 300.0f;
+static const uint32_t CTRL_PERIOD_MS = 4;
+// IMU Constants
+#define MPU_ADDR 0x68
+#define REG_WHO_AM_I 0x75
+#define REG_PWR_MGMT_1 0x6B
+#define REG_CONFIG 0x1A
+#define REG_GYRO_CONFIG 0x1B
+#define REG_ACCEL_CONFIG 0x1C
+#define REG_ACCEL_CONFIG2 0x1D
+#define REG_SMPLRT_DIV 0x19
+#define REG_ACCEL_XOUT_H 0x3B
+static const float GYRO_SENS = 131.0f;     // ±250 dps
+static const float ACCEL_SENS = 16384.0f;  // ±2g
+/* ================= STATE ================= */
+struct Motor {
+  uint8_t pin, ch;
+  volatile float curPct;
+  volatile int tgtPct;
+};
+Motor M[4] = {
+  {MOTOR1_PIN, 0, 0.0f, 0},  // FR - Pin 32
+  {MOTOR2_PIN, 1, 0.0f, 0},  // BR - Pin 26
+  {MOTOR3_PIN, 2, 0.0f, 0},  // BL - Pin 25
+  {MOTOR4_PIN, 3, 0.0f, 0},  // FL - Pin 33
+};
+volatile bool armed = false;
+float vbatVolts = 0.0f;
+uint32_t lastCTRL=0, lastSTATUS=0, lastVBAT=0, lastIMU=0;
+/* ================= IMU STATE ================= */
+static bool imu_ok = false;
+static float gbx=0, gby=0, gbz=0;
+static float roll_f=0, pitch_f=0, yaw_f=0;
+static float p_rate_dps=0, q_rate_dps=0, r_rate_dps=0;
+static uint32_t lastIMUMicros = 0;
+static const float alphaTilt = 0.98f;
+/* ================= CONTROL STATE ================= */
+static bool stabilize_on = false;
+static float baseThrottlePct = 20.0f;
+struct PIDGains { float kp, ki, kd; };
+static PIDGains g{0.06f, 0.003f, 0.020f};
+static float iRoll=0.0f, iPitch=0.0f;
+static const float I_CLAMP = 50.0f;
+static float roll_ref=0, pitch_ref=0;
+static float trimRollPct=0.0f, trimPitchPct=0.0f;
+static const float TRIM_MAX_PCT = 5.0f;
+static const float PID_ON_PCT = 65.0f;
+static bool airborne = false;
+static uint32_t arm_ms = 0;
+static float roll_display_offset = 180.0f;
+/* ================= AVERAGING WINDOW ================= */
+struct AvgWin {
+  static const int MAX = 32;
+  float v[MAX];
+  uint16_t t[MAX];
+  uint8_t head=0, tail=0;
+  double sum=0;
+  void push(float val, uint32_t now_ms) {
+    v[head] = val;
+    t[head] = (uint16_t)(now_ms & 0xFFFF);
+    sum += val;
+    head = (head + 1) % MAX;
+    if(head == tail) { sum -= v[tail]; tail = (tail + 1) % MAX; }
+    while(tail != head) {
+      uint16_t dt = (uint16_t)((now_ms & 0xFFFF) - t[tail]);
+      if(dt <= 100) break;
+      sum -= v[tail];
+      tail = (tail + 1) % MAX;
+    }
+  }
+  float mean() const {
+    int count = (head >= tail) ? (head - tail) : (MAX - tail + head);
+    return count ? (float)(sum / count) : 0.0f;
+  }
+} awRoll, awPitch;
+/* ================= UTILITY FUNCTIONS ================= */
+static inline float fclamp(float v, float lo, float hi) {
+  return v < lo ? lo : (v > hi ? hi : v);
+}
+static inline float rad2deg(float r) { return r * 57.2957795f; }
+static inline float deg2rad(float d) { return d * 0.01745329252f; }
+static void wsSendC(const char* s) { ws.textAll(String(s)); }
+void printfBoth(const char* fmt, ...) {
+  static char buf[128];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  DEBUG_PRINT("[WS] ");
+  DEBUG_PRINTLN(buf);
+  wsSendC(buf);
+}
+static inline uint32_t pctToRaw(float pct) {
+  pct = fclamp(pct, 0.0f, 100.0f);
+  const uint32_t maxRaw = (1u << PWM_RES_BITS) - 1u;
+  return (uint32_t)((pct / 100.0f) * maxRaw + 0.5f);
+}
+/* ================= BATTERY VOLTAGE READING ================= */
+float readVBAT() {
+  const int samples = 8;
+  uint32_t sum = 0;
+  for(int i = 0; i < samples; i++) {
+    uint16_t reading = analogRead(VBAT_ADC_PIN);
+    sum += reading;
+    delayMicroseconds(100);
+  }
+  float avgReading = (float)sum / samples;
+  float voltage = (avgReading / 4095.0f) * 3.3f * 2.0f;
+  DEBUG_PRINTF("[VBAT] Raw ADC: %.1f, Voltage: %.2fV\n", avgReading, voltage);
+  return voltage;
+}
+/* ================= I2C COMMUNICATION ================= */
+bool i2cWrite8(uint8_t addr, uint8_t reg, uint8_t data) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  Wire.write(data);
+  bool success = Wire.endTransmission() == 0;
+  DEBUG_PRINTF("[I2C] Write addr=0x%02X reg=0x%02X data=0x%02X %s\n",
+               addr, reg, data, success ? "OK" : "FAIL");
+  return success;
+}
+bool i2cRead(uint8_t addr, uint8_t reg, uint8_t* buf, size_t len) {
+  Wire.beginTransmission(addr);
+  Wire.write(reg);
+  if(Wire.endTransmission(false) != 0) {
+    DEBUG_PRINTF("[I2C] Read setup failed addr=0x%02X reg=0x%02X\n", addr, reg);
+    return false;
+  }
+  if(Wire.requestFrom((int)addr, (int)len) != (int)len) {
+    DEBUG_PRINTF("[I2C] Read request failed addr=0x%02X len=%d\n", addr, len);
+    return false;
+  }
+  for(size_t i = 0; i < len; i++) buf[i] = Wire.read();
+  return true;
+}
+/* ================= MOTOR MIXER ================= */
+static void mixHoldSum(float base, float uR, float uP, float out[4]) {
+  float tFL = base + uP + uR;  // M4 (Front Left)
+  float tFR = base + uP - uR;  // M1 (Front Right)
+  float tBL = base - uP + uR;  // M3 (Back Left)
+  float tBR = base - uP - uR;  // M2 (Back Right)
+  float motors[4] = { tFR, tBR, tBL, tFL };
+  const float targetSum = 4.0f * base;
+  float actualSum = motors[0] + motors[1] + motors[2] + motors[3];
+  float delta = targetSum - actualSum;
+  if(fabsf(delta) > 1e-6f) {
+    float correction = 0.25f * delta;
+    for(int i = 0; i < 4; i++) motors[i] += correction;
+  }
+  for(int i = 0; i < 4; i++) out[i] = fclamp(motors[i], 0.0f, 100.0f);
+  DEBUG_PRINTF("[MIX] Base=%.1f uR=%.2f uP=%.2f -> M1=%.1f M2=%.1f M3=%.1f M4=%.1f\n",
+               base, uR, uP, out[0], out[1], out[2], out[3]);
+}
+/* ================= IMU FUNCTIONS ================= */
+bool mpuInit() {
+  DEBUG_PRINTLN("[IMU] Initializing MPU6050...");
+  uint8_t whoami = 0;
+  if(!i2cRead(MPU_ADDR, REG_WHO_AM_I, &whoami, 1)) {
+    DEBUG_PRINTLN("[IMU] Failed to read WHO_AM_I");
+    return false;
+  }
+  DEBUG_PRINTF("[IMU] WHO_AM_I = 0x%02X\n", whoami);
+  // Reset and wake
+  DEBUG_PRINTLN("[IMU] Resetting device...");
+  i2cWrite8(MPU_ADDR, REG_PWR_MGMT_1, 0x80);
+  delay(100);
+  DEBUG_PRINTLN("[IMU] Waking device...");
+  i2cWrite8(MPU_ADDR, REG_PWR_MGMT_1, 0x00);
+  delay(50);
+  // Sample rate ~100 Hz
+  DEBUG_PRINTLN("[IMU] Configuring sample rate...");
+  i2cWrite8(MPU_ADDR, REG_SMPLRT_DIV, 9);
+  // DLPFs ~41 Hz on gyro and accel
+  DEBUG_PRINTLN("[IMU] Configuring filters...");
+  i2cWrite8(MPU_ADDR, REG_CONFIG, 0x03);
+  i2cWrite8(MPU_ADDR, REG_GYRO_CONFIG, 0x00);
+  i2cWrite8(MPU_ADDR, REG_ACCEL_CONFIG, 0x00);
+  i2cWrite8(MPU_ADDR, REG_ACCEL_CONFIG2, 0x03);
+  DEBUG_PRINTLN("[IMU] Initialization complete");
+  return true;
+}
+void calibrateGyro() {
+  DEBUG_PRINTLN("[IMU] Starting gyro calibration (200 samples)...");
+  long sx = 0, sy = 0, sz = 0;
+  const int samples = 200;
+  for(int i = 0; i < samples; i++) {
+    uint8_t buf[14];
+    if(i2cRead(MPU_ADDR, REG_ACCEL_XOUT_H, buf, 14)) {
+      int16_t gx = (int16_t)((buf[8] << 8) | buf[9]);
+      int16_t gy = (int16_t)((buf[10] << 8) | buf[11]);
+      int16_t gz = (int16_t)((buf[12] << 8) | buf[13]);
+      sx += gx; sy += gy; sz += gz;
+    }
+    if(i % 50 == 0) DEBUG_PRINTF("[IMU] Calibration %d%%...\n", (i*100)/samples);
+    delay(5);
+  }
+  gbx = (sx / (float)samples) / GYRO_SENS;
+  gby = (sy / (float)samples) / GYRO_SENS;
+  gbz = (sz / (float)samples) / GYRO_SENS;
+  DEBUG_PRINTF("[IMU] Gyro biases: X=%.3f Y=%.3f Z=%.3f dps\n", gbx, gby, gbz);
+}
+void imuStep() {
+  uint8_t buf[14];
+  if(!i2cRead(MPU_ADDR, REG_ACCEL_XOUT_H, buf, 14)) return;
+  // Parse raw
+  int16_t axr = (int16_t)((buf[0] << 8) | buf[1]);
+  int16_t ayr = (int16_t)((buf[2] << 8) | buf[3]);
+  int16_t azr = (int16_t)((buf[4] << 8) | buf[5]);
+  int16_t gxr = (int16_t)((buf[8] << 8) | buf[9]);
+  int16_t gyr = (int16_t)((buf[10] << 8) | buf[11]);
+  int16_t gzr = (int16_t)((buf[12] << 8) | buf[13]);
+  // Convert to physical units
+  float ax = axr / ACCEL_SENS;
+  float ay = ayr / ACCEL_SENS;
+  float az = azr / ACCEL_SENS;
+  float gx = (gxr / GYRO_SENS) - gbx;
+  float gy = (gyr / GYRO_SENS) - gby;
+  float gz = (gzr / GYRO_SENS) - gbz;
+  // Calculate time step
+  uint32_t nowMicros = micros();
+  float dt = (nowMicros - lastIMUMicros) * 1e-6f;
+  lastIMUMicros = nowMicros;
+  if(dt <= 0 || dt > 0.05f) dt = 0.004f;
+  // Check accel validity
+  float accel_mag = sqrtf(ax*ax + ay*ay + az*az);
+  bool accel_ok = (accel_mag > 0.8f && accel_mag < 1.2f);
+  // Attitude from accelerometer
+  float rollAcc  = rad2deg(atan2f(ay, az));
+  float pitchAcc = rad2deg(atan2f(-ax, sqrtf(ay*ay + az*az)));
+  // Gyro integrate
+  float rollGy  = roll_f  + gx * dt;
+  float pitchGy = pitch_f + gy * dt;
+  // Complementary filter
+  if (accel_ok) {
+    roll_f  = alphaTilt * rollGy  + (1.0f - alphaTilt) * rollAcc;
+    pitch_f = alphaTilt * pitchGy + (1.0f - alphaTilt) * pitchAcc;
+  } else {
+    roll_f  = rollGy;
+    pitch_f = pitchGy;
+  }
+  // Gyro deadzone
+  if(fabsf(gx) < 0.05f) gx = 0;
+  if(fabsf(gy) < 0.05f) gy = 0;
+  if(fabsf(gz) < 0.05f) gz = 0;
+  p_rate_dps = gx;
+  q_rate_dps = gy;
+  r_rate_dps = gz;
+  // Yaw integration
+  float phi   = deg2rad(roll_f);
+  float theta = deg2rad(pitch_f);
+  float cosTheta = cosf(theta);
+  float yawRate_rad = (fabsf(cosTheta) > 0.1f) ?
+    (deg2rad(gy) * sinf(phi) + deg2rad(gz) * cosf(phi)) / cosTheta :
+    deg2rad(gz);
+  yaw_f += rad2deg(yawRate_rad) * dt;
+  if(!armed) {
+    yaw_f = 0.0f;
+  } else {
+    while(yaw_f > 180.0f) yaw_f -= 360.0f;
+    while(yaw_f < -180.0f) yaw_f += 360.0f;
+  }
+  // Update averaging windows
+  uint32_t nowMs = millis();
+  awRoll.push(roll_f, nowMs);
+  awPitch.push(pitch_f, nowMs);
+  static uint32_t lastDebugPrint = 0;
+  if(millis() - lastDebugPrint > 1000) {
+    DEBUG_PRINTF("[IMU] R=%.1f P=%.1f Y=%.1f | Rates: %.1f %.1f %.1f dps\n",
+                 roll_f, pitch_f, yaw_f, gx, gy, gz);
+    lastDebugPrint = millis();
+  }
+}
+/* ================= STATUS REPORTING ================= */
+static char g_statusLine[128];
+static const char* composeStatusLine() {
+  float r_rel = awRoll.mean() - roll_ref;
+  float p_rel = awPitch.mean() - pitch_ref;
+  float roll_display = r_rel + roll_display_offset;
+  while(roll_display > 180.0f) roll_display -= 360.0f;
+  while(roll_display < -180.0f) roll_display += 360.0f;
+  if(imu_ok) {
+    snprintf(g_statusLine, sizeof(g_statusLine),
+      "M1=%d%% M2=%d%% M3=%d%% M4=%d%% VBAT=%.2fV R=%.1f P=%.1f Y=%.1f",
+      (int)roundf(M[0].curPct), (int)roundf(M[1].curPct),
+      (int)roundf(M[2].curPct), (int)roundf(M[3].curPct),
+      vbatVolts, roll_display, p_rel, yaw_f);
+  } else {
+    snprintf(g_statusLine, sizeof(g_statusLine),
+      "M1=%d%% M2=%d%% M3=%d%% M4=%d%% VBAT=%.2fV",
+      (int)roundf(M[0].curPct), (int)roundf(M[1].curPct),
+      (int)roundf(M[2].curPct), (int)roundf(M[3].curPct), vbatVolts);
+  }
+  return g_statusLine;
+}
+static inline void printStatusLine() { wsSendC(composeStatusLine()); }
+static inline void printStateLine() { wsSendC(armed ? "STATE armed=1" : "STATE armed=0"); }
+/* ================= CONFIGURATION ================= */
+Preferences prefs;
+static void saveConfig() {
+  DEBUG_PRINTLN("[CONFIG] Saving to flash...");
+  prefs.putFloat("kp", g.kp);
+  prefs.putFloat("ki", g.ki);
+  prefs.putFloat("kd", g.kd);
+  prefs.putFloat("base", baseThrottlePct);
+  prefs.putBool("stab", stabilize_on);
+  prefs.putFloat("trimR", trimRollPct);
+  prefs.putFloat("trimP", trimPitchPct);
+  DEBUG_PRINTF("[CONFIG] Saved: Kp=%.3f Ki=%.3f Kd=%.3f Base=%.1f%%\n",
+               g.kp, g.ki, g.kd, baseThrottlePct);
+}
+static void loadConfig() {
+  DEBUG_PRINTLN("[CONFIG] Loading from flash...");
+  g.kp = prefs.getFloat("kp", g.kp);
+  g.ki = prefs.getFloat("ki", g.ki);
+  g.kd = prefs.getFloat("kd", g.kd);
+  baseThrottlePct = prefs.getFloat("base", baseThrottlePct);
+  stabilize_on = prefs.getBool("stab", stabilize_on);
+  trimRollPct = prefs.getFloat("trimR", 0.0f);
+  trimPitchPct = prefs.getFloat("trimP", 0.0f);
+  DEBUG_PRINTF("[CONFIG] Loaded: Kp=%.3f Ki=%.3f Kd=%.3f Base=%.1f%%\n",
+               g.kp, g.ki, g.kd, baseThrottlePct);
+}
+/* ================= ARM/DISARM CONTROL ================= */
+void setArmed(bool on) {
+  DEBUG_PRINTF("[ARM] %s requested\n", on ? "ARM" : "DISARM");
+  armed = on;
+  if(on) {
+    arm_ms = millis();
+    yaw_f = 0.0f;
+    DEBUG_PRINTLN("[ARM] System ARMED - motors enabled");
+  } else {
+    DEBUG_PRINTLN("[ARM] System DISARMED - stopping all motors");
+    for(int i = 0; i < 4; i++) {
+      M[i].tgtPct = 0;
+      M[i].curPct = 0.0f;
+      ledcWrite(M[i].ch, 0);
+      DEBUG_PRINTF("[ARM] Motor %d stopped\n", i+1);
+    }
+    airborne = false;
+    yaw_f = 0.0f;
+  }
+  printfBoth(on ? "OK: ARMED" : "OK: DISARMED");
+  printStateLine();
+}
+void captureRefs() {
+  roll_ref = awRoll.mean();
+  pitch_ref = awPitch.mean();
+  roll_display_offset = 0.0f;
+  DEBUG_PRINTF("[REF] Level reference captured: Roll=%.1f Pitch=%.1f\n", roll_ref, pitch_ref);
+  printfBoth("OK: Level reference set");
+  printStatusLine();
+}
+/* ================= WEBSOCKET HANDLING ================= */
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type,
+               void *arg, uint8_t *data, size_t len) {
+  if(type == WS_EVT_CONNECT) {
+    DEBUG_PRINTF("[WS] Client connected: ID=%d IP=%s\n", client->id(), client->remoteIP().toString().c_str());
+    client->text("[Connected to Flight Controller]");
+  }
+  else if(type == WS_EVT_DISCONNECT) {
+    DEBUG_PRINTF("[WS] Client disconnected: ID=%d\n", client->id());
+    if(ws.count() == 0 && armed) {
+      DEBUG_PRINTLN("[WS] Last client disconnected - emergency disarm!");
+      setArmed(false);
+    }
+  }
+}
+/* ================= WIFI SETUP ================= */
+void setupWiFi() {
+  DEBUG_PRINTLN("[WIFI] Starting WiFi setup...");
+  if(strlen(WIFI_STA_SSID) > 0) {
+    DEBUG_PRINTF("[WIFI] Attempting STA mode: SSID=%s\n", WIFI_STA_SSID);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(WIFI_STA_SSID, WIFI_STA_PASS);
+    uint32_t startTime = millis();
+    while(WiFi.status() != WL_CONNECTED && millis() - startTime < 8000) {
+      delay(200);
+      DEBUG_PRINT(".");
+    }
+    DEBUG_PRINTLN();
+    if(WiFi.status() == WL_CONNECTED) {
+      WiFi.setSleep(true);
+      WiFi.setTxPower(WIFI_POWER_8_5dBm);
+      DEBUG_PRINTF("[WIFI] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+      return;
+    }
+    DEBUG_PRINTLN("[WIFI] STA connection failed, falling back to AP mode");
+  }
+  DEBUG_PRINTF("[WIFI] Starting AP mode: SSID=%s\n", AP_SSID);
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  DEBUG_PRINTF("[WIFI] AP started! IP: %s\n", WiFi.softAPIP().toString().c_str());
+}
+/* ================= WEB SERVER SETUP ================= */
+void setupWebServer() {
+  DEBUG_PRINTLN("[WEB] Setting up web server...");
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *req) {
+    DEBUG_PRINTLN("[WEB] GET /");
+    req->send_P(200, "text/html", INDEX_HTML);
+  });
+  server.on("/arm", HTTP_GET, [](AsyncWebServerRequest *r) {
+    DEBUG_PRINTLN("[WEB] GET /arm");
+    setArmed(true);
+    r->send(200, "text/plain", "OK");
+  });
+  server.on("/disarm", HTTP_GET, [](AsyncWebServerRequest *r) {
+    DEBUG_PRINTLN("[WEB] GET /disarm");
+    setArmed(false);
+    r->send(200, "text/plain", "OK");
+  });
+  server.on("/state", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send(200, "text/plain", armed ? "STATE armed=1" : "STATE armed=0");
+  });
+  server.on("/status", HTTP_GET, [](AsyncWebServerRequest *r) {
+    r->send(200, "text/plain", String(composeStatusLine()));
+  });
+  server.on("/cfg", HTTP_GET, [](AsyncWebServerRequest* req) {
+    String json = "{";
+    json += "\"stab\":" + String(stabilize_on ? "true" : "false");
+    json += ",\"thr\":" + String(baseThrottlePct, 1);
+    json += ",\"kp\":" + String(g.kp, 3);
+    json += ",\"ki\":" + String(g.ki, 3);
+    json += ",\"kd\":" + String(g.kd, 3);
+    json += ",\"trimR\":" + String(trimRollPct, 1);
+    json += ",\"trimP\":" + String(trimPitchPct, 1);
+    json += "}";
+    req->send(200, "application/json", json);
+  });
+  server.on("/setstab", HTTP_GET, [](AsyncWebServerRequest* req) {
+    int enable = req->hasParam("on") ? req->getParam("on")->value().toInt() : 0;
+    stabilize_on = (enable != 0);
+    DEBUG_PRINTF("[WEB] Stabilization %s\n", stabilize_on ? "ENABLED" : "DISABLED");
+    if(stabilize_on) captureRefs();
+    saveConfig();
+    printfBoth("OK: Stabilization %s", stabilize_on ? "enabled" : "disabled");
+    req->send(200, "text/plain", "OK");
+  });
+  server.on("/setall", HTTP_GET, [](AsyncWebServerRequest* req) {
+    bool configChanged = false;
+    if(req->hasParam("base")) {
+      float newBase = fclamp(req->getParam("base")->value().toFloat(), 0.0f, 100.0f);
+      if(abs(newBase - baseThrottlePct) > 0.1f) {
+        DEBUG_PRINTF("[WEB] Throttle changed: %.1f%% -> %.1f%%\n", baseThrottlePct, newBase);
+        baseThrottlePct = newBase;
+        configChanged = true;
+      }
+    }
+    if(req->hasParam("kp")) {
+      float v=req->getParam("kp")->value().toFloat();
+      if(abs(v - g.kp) > 0.001f) {
+        DEBUG_PRINTF("[WEB] Kp changed: %.3f -> %.3f\n", g.kp, v);
+        g.kp=v;
+        configChanged=true;
+      }
+    }
+    if(req->hasParam("ki")) {
+      float v=req->getParam("ki")->value().toFloat();
+      if(abs(v - g.ki) > 0.0001f) {
+        DEBUG_PRINTF("[WEB] Ki changed: %.4f -> %.4f\n", g.ki, v);
+        g.ki=v;
+        configChanged=true;
+      }
+    }
+    if(req->hasParam("kd")) {
+      float v=req->getParam("kd")->value().toFloat();
+      if(abs(v - g.kd) > 0.001f) {
+        DEBUG_PRINTF("[WEB] Kd changed: %.3f -> %.3f\n", g.kd, v);
+        g.kd=v;
+        configChanged=true;
+      }
+    }
+    if(req->hasParam("trimR")) {
+      float v=fclamp(req->getParam("trimR")->value().toFloat(), -TRIM_MAX_PCT, TRIM_MAX_PCT);
+      if(abs(v - trimRollPct) > 0.05f) {
+        DEBUG_PRINTF("[WEB] Roll trim changed: %.1f -> %.1f\n", trimRollPct, v);
+        trimRollPct=v;
+        configChanged=true;
+      }
+    }
+    if(req->hasParam("trimP")) {
+      float v=fclamp(req->getParam("trimP")->value().toFloat(), -TRIM_MAX_PCT, TRIM_MAX_PCT);
+      if(abs(v - trimPitchPct) > 0.05f) {
+        DEBUG_PRINTF("[WEB] Pitch trim changed: %.1f -> %.1f\n", trimPitchPct, v);
+        trimPitchPct=v;
+        configChanged=true;
+      }
+    }
+    if(configChanged) {
+      iRoll = iPitch = 0.0f;
+      saveConfig();
+      printfBoth("OK: Settings saved to flash");
+    }
+    req->send(200, "text/plain", configChanged ? "OK: Settings saved" : "OK: No changes");
+  });
+  server.on("/zeroref", HTTP_GET, [](AsyncWebServerRequest* req) {
+    DEBUG_PRINTLN("[WEB] GET /zeroref");
+    captureRefs();
+    req->send(200, "text/plain", "OK");
+  });
+  ws.onEvent(onWsEvent);
+  server.addHandler(&ws);
+  server.begin();
+  DEBUG_PRINTLN("[WEB] Web server started");
+}
+/* ================= MAIN SETUP ================= */
+void setup() {
+  Serial.begin(115200);
+  delay(2000);  // Give time for serial monitor to connect
+  DEBUG_PRINTLN("\n\n========================================");
+  DEBUG_PRINTLN("ESP32 WROOM-32 Flight Controller");
+  DEBUG_PRINTLN("========================================");
+#ifdef DEBUG_MOTOR_SINGLE
+  DEBUG_PRINTLN("*** DEBUG MODE: SINGLE MOTOR ONLY ***");
+  DEBUG_PRINTLN("*** ONLY MOTOR 1 WILL BE ENABLED ***");
+#endif
+  DEBUG_PRINTLN("\n[INIT] Starting initialization sequence...");
+  // ADC setup
+  DEBUG_PRINTLN("[INIT] Configuring ADC...");
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  DEBUG_PRINTLN("[INIT] ADC configured: 12-bit resolution, 11dB attenuation");
+  // PWM setup
+  DEBUG_PRINTLN("[INIT] Configuring PWM channels...");
+  for(int ch = 0; ch < 4; ch++) {
+    ledcSetup(ch, PWM_FREQ_HZ, PWM_RES_BITS);
+    DEBUG_PRINTF("[INIT] PWM channel %d: %d Hz, %d-bit\n", ch, PWM_FREQ_HZ, PWM_RES_BITS);
+  }
+  // Motor pins setup
+  DEBUG_PRINTLN("[INIT] Configuring motor pins...");
+  for(int i = 0; i < 4; i++) {
+    pinMode(M[i].pin, OUTPUT);
+    ledcAttachPin(M[i].pin, M[i].ch);
+    ledcWrite(M[i].ch, 0);
+    DEBUG_PRINTF("[INIT] Motor %d: Pin=%d Channel=%d\n", i+1, M[i].pin, M[i].ch);
+  }
+  // I2C setup
+  DEBUG_PRINTF("[INIT] Initializing I2C: SDA=%d SCL=%d @ 400kHz...\n", I2C_SDA, I2C_SCL);
+  Wire.begin(I2C_SDA, I2C_SCL, 400000);
+  delay(50);
+  // IMU setup
+  imu_ok = mpuInit();
+  if(imu_ok) {
+    calibrateGyro();
+    uint8_t buf[14];
+    if(i2cRead(MPU_ADDR, REG_ACCEL_XOUT_H, buf, 14)) {
+      int16_t ax = (int16_t)((buf[0] << 8) | buf[1]);
+      int16_t ay = (int16_t)((buf[2] << 8) | buf[3]);
+      int16_t az = (int16_t)((buf[4] << 8) | buf[5]);
+      float axg = ax / ACCEL_SENS;
+      float ayg = ay / ACCEL_SENS;
+      float azg = az / ACCEL_SENS;
+      roll_f = rad2deg(atan2f(ayg, azg));
+      pitch_f = rad2deg(atan2f(-axg, sqrtf(ayg*ayg + azg*azg)));
+      yaw_f = 0.0f;
+      uint32_t nowMs = millis();
+      awRoll.push(roll_f, nowMs);
+      awPitch.push(pitch_f, nowMs);
+      DEBUG_PRINTF("[IMU] Initial attitude: Roll=%.1f Pitch=%.1f\n", roll_f, pitch_f);
+    }
+    lastIMUMicros = micros();
+  } else {
+    DEBUG_PRINTLN("[IMU] *** WARNING: IMU initialization failed! ***");
+  }
+  // WiFi and web server
+  setupWiFi();
+  prefs.begin("fc", false);
+  loadConfig();
+  setupWebServer();
+  // Initial battery reading
+  vbatVolts = readVBAT();
+  printStatusLine();
+  printStateLine();
+  DEBUG_PRINTLN("\n========================================");
+  DEBUG_PRINTLN("Flight Controller Ready!");
+  DEBUG_PRINTLN("========================================\n");
+}
+/* ================= MAIN CONTROL LOOP ================= */
+void loop() {
+  ws.cleanupClients();
+  uint32_t now = millis();
+  // Safety: Emergency disarm on client disconnect
+  static int lastClientCount = 0;
+  int currentClients = ws.count();
+  if(currentClients == 0 && lastClientCount > 0 && armed) {
+    setArmed(false);
+  }
+  lastClientCount = currentClients;
+  // IMU update at ~250Hz
+  if(imu_ok && (now - lastIMU) >= 4) {
+    lastIMU = now;
+    imuStep();
+  }
+  // Main control loop at 250Hz
+  if(now - lastCTRL >= CTRL_PERIOD_MS) {
+    float deltaTime = (now - lastCTRL) / 1000.0f;
+    lastCTRL = now;
+    float slewStep = SLEW_PCT_PER_SEC * deltaTime;
+    float uRoll = trimRollPct;
+    float uPitch = trimPitchPct;
+    if(stabilize_on) {
+      float roll_error  = -(awRoll.mean()  - roll_ref);
+      float pitch_error = -(awPitch.mean() - pitch_ref);
+      float roll_rate  = -p_rate_dps;
+      float pitch_rate = -q_rate_dps;
+      bool pidActive = (baseThrottlePct >= PID_ON_PCT);
+      if(pidActive) {
+        float relaxRoll  = (fabsf(roll_rate)  < 120.0f) ? 1.0f : 0.0f;
+        float relaxPitch = (fabsf(pitch_rate) < 120.0f) ? 1.0f : 0.0f;
+        iRoll  = fclamp((0.9f * iRoll  + roll_error  * deltaTime * relaxRoll),  -I_CLAMP, I_CLAMP);
+        iPitch = fclamp((0.9f * iPitch + pitch_error * deltaTime * relaxPitch), -I_CLAMP, I_CLAMP);
+        float pidRoll  = -(g.kp * roll_error  + g.ki * iRoll  + g.kd * roll_rate);
+        float pidPitch = -(g.kp * pitch_error + g.ki * iPitch + g.kd * pitch_rate);
+        float thrustScale = baseThrottlePct / 20.0f;
+        uRoll  += pidRoll  * thrustScale;
+        uPitch += pidPitch * thrustScale * 1.6f;
+      } else {
+        iRoll *= 0.99f; iPitch *= 0.99f;
+      }
+    }
+    float effectiveThrottle = baseThrottlePct;
+    if(armed && !airborne) {
+      float timeSinceArm = (millis() - arm_ms);
+      float rampFactor = fclamp(timeSinceArm / 600.0f, 0.0f, 1.0f);
+      effectiveThrottle = max(effectiveThrottle, 4.0f + rampFactor * (baseThrottlePct - 4.0f));
+    }
+    float motorTargets[4];
+    mixHoldSum(effectiveThrottle, uRoll, uPitch, motorTargets);
+    for(int i = 0; i < 4; i++) M[i].tgtPct = (int)roundf(motorTargets[i]);
+    static uint32_t lastBelowThreshold = millis();
+    float avgOutput = 0.25f * (motorTargets[0] + motorTargets[1] + motorTargets[2] + motorTargets[3]);
+    if(avgOutput > 7.0f) {
+      if(millis() - lastBelowThreshold > 200) airborne = true;
+    } else {
+      lastBelowThreshold = millis();
+      airborne = false;
+    }
+    // Motor output with single-motor debug mode
+    for(int i = 0; i < 4; i++) {
+      float target = armed ? (float)M[i].tgtPct : 0.0f;
+#ifdef DEBUG_MOTOR_SINGLE
+      // In debug mode, only allow Motor 1 to run
+      if(i != 0) target = 0.0f;
+#endif
+      float current = M[i].curPct;
+      float difference = target - current;
+      float slewStep = SLEW_PCT_PER_SEC * deltaTime;
+      if(fabsf(difference) <= slewStep) current = target;
+      else current += (difference > 0) ? slewStep : -slewStep;
+      M[i].curPct = current;
+      uint32_t rawPWM = pctToRaw(current);
+      ledcWrite(M[i].ch, rawPWM);
+      // Debug output for significant changes
+      static float lastDebugPct[4] = {0, 0, 0, 0};
+      if(fabsf(current - lastDebugPct[i]) > 5.0f) {
+        DEBUG_PRINTF("[MOTOR%d] PWM: %d (%.1f%%) Pin: %d\n", i+1, rawPWM, current, M[i].pin);
+        lastDebugPct[i] = current;
+      }
+    }
+  }
+  // Battery voltage update (2Hz)
+  if(now - lastVBAT >= 500) {
+    lastVBAT = now;
+    float newReading = readVBAT();
+    vbatVolts = 0.8f * vbatVolts + 0.2f * newReading;
+  }
+  // Status transmission (20Hz)
+  if(now - lastSTATUS >= 50) {
+    lastSTATUS = now;
+    printStatusLine();
+    printStateLine();
+  }
+}
